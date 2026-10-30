@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    MSI 全局卸载清理器 v2.3 - 统一清单，智能卸载通道
+    MSI 全局卸载清理器 v2.3.1 - 统一清单，智能卸载通道
 .DESCRIPTION
     显示全部 = MSI Installer UserData + 控制面板卸载记录，按 MSI ProductCode 精确关联去重。
     同一个 MSI 产品两种来源仅显示一行，按 MSI 通道卸载；仅控制面板记录走注册卸载程序。
@@ -20,7 +20,7 @@ Add-Type -AssemblyName System.Data
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 function Show-Dialog {
-    param([string]$Text, [string]$Title = 'MSI 全局卸载清理器 v2.3', [string]$Buttons = 'OK', [string]$Icon = 'Information')
+    param([string]$Text, [string]$Title = 'MSI 全局卸载清理器 v2.3.1', [string]$Buttons = 'OK', [string]$Icon = 'Information')
     return [System.Windows.Forms.MessageBox]::Show($Text,$Title,([System.Windows.Forms.MessageBoxButtons]$Buttons),([System.Windows.Forms.MessageBoxIcon]$Icon))
 }
 
@@ -78,7 +78,7 @@ try {
     }
 }
 catch { Write-Log ('无法读取或生成 INI，采用人工确认模式：' + $_.Exception.Message) }
-Write-Log ('启动 v2.3；AutoForceOnFailure=' + [int]$script:autoForceOnFailure)
+Write-Log ('启动 v2.3.1；AutoForceOnFailure=' + [int]$script:autoForceOnFailure)
 
 function Convert-PackedGuid {
     param([string]$Packed)
@@ -207,7 +207,7 @@ Write-Log ("读取完毕：MSI=$msiCount，控制面板=$appwizCount，合并交
 
 # ============================== GUI ==============================
 $form = New-Object System.Windows.Forms.Form -Property @{
-    Text='MSI 全局卸载清理器 v2.3｜MSI + 控制面板统一列表（智能通道）'
+    Text='MSI 全局卸载清理器 v2.3.1｜MSI + 控制面板统一列表（智能通道）'
     Width=1270; Height=730; StartPosition='CenterScreen'
     Font=(New-Object System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
     MinimumSize=(New-Object System.Drawing.Size -ArgumentList @(1050,580))
@@ -464,6 +464,8 @@ function Split-UninstallCommand {
 
 
 # ======================= 可视化批量卸载队列 =======================
+# 注意: PowerShell 5.1 会把中文弯引号视作字符串引号。
+# 对 UI 提示文字请使用【】或普通括号, 避免字符串被意外截断。
 # 使用 WinForms Timer 轮询子进程退出状态，不在 GUI 线程使用 Start-Process -Wait。
 # 进度条表示已处理的软件数量；原生 EXE 卸载器不提供统一百分比接口。
 $script:queue = $null
@@ -513,8 +515,8 @@ function Finish-UninstallQueue {
     $q.Close.Visible = $true
     $q.Header.Text = ('批量卸载处理结束。成功 {0} 项，清理 MSI 登记 {1} 项，待核实 {2} 项，失败 {3} 项，跳过 {4} 项。' -f
        $q.Success,$q.Cleaned,$q.Review,$q.Failed,$q.Skipped)
-    $q.Current.Text = '任务已结束。可在下方逐项查看结果，点击“关闭程序”退出。'
-    $q.Dlg.Text = 'MSI 全局卸载清理器 v2.3｜卸载结果'
+    $q.Current.Text = '任务已结束。可在下方逐项查看结果，点击【关闭程序】退出。'
+    $q.Dlg.Text = 'MSI 全局卸载清理器 v2.3.1｜卸载结果'
     Update-QueueCaption
     Write-Log ('批量队列结束；日志：' + $script:logPath)
 }
@@ -631,7 +633,7 @@ function Check-QueueTick {
             }
             elseif ((Get-Date) -ge $q.VerifyUntil) {
                 $q.Continue.Visible = $true
-                $q.Current.Text = "卸载器已退出，但注册表仍显示该程序。确认原卸载程序已结束后，点击“继续下一项”。"
+                $q.Current.Text = "卸载器已退出，但注册表仍显示该程序。确认原卸载程序已结束后，点击【继续下一项】。"
                 $q.View.Rows[$q.ActiveIndex]['执行状态'] = '等待人工确认（卸载记录仍在）'
             }
             else {
@@ -786,7 +788,7 @@ function Show-BatchUninstallDialog {
         $script:batchActuallyStarted=$true
         $q.Start.Enabled=$false
         $q.Stop.Text='停止后续任务'
-        $q.Dlg.Text='MSI 全局卸载清理器 v2.3｜正在批量卸载'
+        $q.Dlg.Text='MSI 全局卸载清理器 v2.3.1｜正在批量卸载'
         $q.Header.Text='批量卸载进行中：程序将逐项启动卸载器，下面实时记录处理结果。停止后续任务不会结束当前卸载器。'
         Write-Log ("批量卸载开始：共 $($q.Rows.Count) 项，自动强制清理=$([int]$script:autoForceOnFailure)")
         Start-QueueProcess
@@ -819,7 +821,7 @@ function Show-BatchUninstallDialog {
         $exists = ($key -and (Test-Path -LiteralPath $key -ErrorAction SilentlyContinue))
         if ($exists) {
             $reply = [System.Windows.Forms.MessageBox]::Show($q.Dlg,
-                "该软件的控制面板卸载登记仍然存在。只有在确认原生卸载器已完成后才建议继续。`r`n是否继续队列，并将此项标记为“待核实”？",
+                "该软件的控制面板卸载登记仍然存在。只有在确认原生卸载器已完成后才建议继续。`r`n是否继续队列，并将此项标记为【待核实】？",
                 '确认卸载器状态',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning)
             if ($reply -ne [System.Windows.Forms.DialogResult]::Yes) { return }
             Complete-QueueRow '卸载器已退出（卸载登记仍在，待核实）' 'Review'
@@ -834,7 +836,7 @@ function Show-BatchUninstallDialog {
         if ($null -ne $q -and $q.Started -and -not $q.Finished) {
             $_.Cancel=$true
             [void][System.Windows.Forms.MessageBox]::Show($q.Dlg,
-                '卸载任务仍在进行。请先点击“停止后续任务”，等待当前卸载器结束，再关闭窗口。',
+                '卸载任务仍在进行。请先点击【停止后续任务】，等待当前卸载器结束，再关闭窗口。',
                 '正在卸载',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
         }
     })
@@ -856,7 +858,7 @@ $btnOk.Add_Click({
     if ($null -eq $script:queue -and $script:batchActuallyStarted) { $form.Close() }
 })
 
-# 记录是否真正开始任务，以区分“取消确认”与“处理完毕后关闭”。
+# 记录是否真正开始任务，以区分【取消确认】与【处理完毕后关闭】。
 # 在对话框中开始时设置，在对话框关闭后由主窗体点击事件读取。
 $script:batchActuallyStarted=$false
 
