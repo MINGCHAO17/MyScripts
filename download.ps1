@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    MSI 全局卸载清理器 v2.1（MSI / appwiz.cpl 双通道）
+    MSI 全局卸载清理器 v2.1.1（MSI / appwiz.cpl 双通道）
 .DESCRIPTION
     默认显示 MSI Installer UserData 中的产品；appwiz.cpl 按钮显示“程序和功能”卸载注册表项目。
     两个模式完全隔离：MSI 卸载失败才允许逐项确认并备份注册表后清理；
@@ -10,6 +10,9 @@
     点击“显示全部”返回默认 MSI 列表；模式切换清空全部勾选。
     强制清理仅删除有限的安装登记项，不等于卸载软件文件，也不保证修复安装器。
 #>
+
+# 通过 irm ... | iex 执行时：下载完成后先清屏，再打开窗口。
+Clear-Host -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -31,14 +34,26 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $script:baseDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MSIUninstallCleaner'
 $logDir = Join-Path $script:baseDir 'Logs'
 [void][IO.Directory]::CreateDirectory($logDir)
+$script:logFailureReported = $false
 $script:logPath = Join-Path $logDir ('Uninstall_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
 function Write-Log {
     param([string]$Message)
     $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    Write-Host $line
+    # 仅写入本地文件；不向 PowerShell 终端打印运行日志。
     try { Add-Content -LiteralPath $script:logPath -Value $line -Encoding UTF8 -ErrorAction Stop }
-    catch { Write-Warning ('写入日志失败：' + $_.Exception.Message) }
+    catch {
+        # 仅在日志不可写时提示一次，不将错误消息刷到控制台。
+        if (-not $script:logFailureReported) {
+            $script:logFailureReported = $true
+            [void][System.Windows.Forms.MessageBox]::Show(
+                ('无法写入日志文件：' + $script:logPath + [Environment]::NewLine + $_.Exception.Message),
+                '日志保存失败',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+        }
+    }
 }
 
 function Show-Dialog {
@@ -151,7 +166,7 @@ Write-Log ("读取完成：MSI $msiCount 项，appwiz.cpl $appwizCount 项。")
 
 # ============================== 图形界面 ==============================
 $form = New-Object System.Windows.Forms.Form -Property @{
-    Text='MSI 全局卸载清理器 v2.1｜MSI 强制清理 / appwiz.cpl 正常卸载（独立通道）'
+    Text='MSI 全局卸载清理器 v2.1.1｜MSI 强制清理 / appwiz.cpl 正常卸载（独立通道）'
     Width=1190; Height=700; StartPosition='CenterScreen'; Font=(New-Object -TypeName System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
     MinimumSize=(New-Object -TypeName System.Drawing.Size -ArgumentList @(1000,560))
 }
