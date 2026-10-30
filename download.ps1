@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    MSI 全局卸载清理器 v2.2 - 统一清单，智能卸载通道
+    MSI 全局卸载清理器 v2.3 - 统一清单，智能卸载通道
 .DESCRIPTION
     显示全部 = MSI Installer UserData + 控制面板卸载记录，按 MSI ProductCode 精确关联去重。
     同一个 MSI 产品两种来源仅显示一行，按 MSI 通道卸载；仅控制面板记录走注册卸载程序。
@@ -11,6 +11,8 @@
 #>
 
 # 远程 irm ... | iex 时自动清屏；不向终端打印正常运行日志。
+# 仅从 irm ... | iex 的独立控制台运行时，在关闭 GUI 后结束该 PowerShell 会话。
+$script:closeConsoleOnExit = ([string]::IsNullOrWhiteSpace($PSCommandPath) -and $Host.Name -eq 'ConsoleHost' -and $PSVersionTable.PSVersion.Major -eq 5)
 Clear-Host -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -18,7 +20,7 @@ Add-Type -AssemblyName System.Data
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 function Show-Dialog {
-    param([string]$Text, [string]$Title = 'MSI 全局卸载清理器 v2.2', [string]$Buttons = 'OK', [string]$Icon = 'Information')
+    param([string]$Text, [string]$Title = 'MSI 全局卸载清理器 v2.3', [string]$Buttons = 'OK', [string]$Icon = 'Information')
     return [System.Windows.Forms.MessageBox]::Show($Text,$Title,([System.Windows.Forms.MessageBoxButtons]$Buttons),([System.Windows.Forms.MessageBoxIcon]$Icon))
 }
 
@@ -76,7 +78,7 @@ try {
     }
 }
 catch { Write-Log ('无法读取或生成 INI，采用人工确认模式：' + $_.Exception.Message) }
-Write-Log ('启动 v2.2；AutoForceOnFailure=' + [int]$script:autoForceOnFailure)
+Write-Log ('启动 v2.3；AutoForceOnFailure=' + [int]$script:autoForceOnFailure)
 
 function Convert-PackedGuid {
     param([string]$Packed)
@@ -205,7 +207,7 @@ Write-Log ("读取完毕：MSI=$msiCount，控制面板=$appwizCount，合并交
 
 # ============================== GUI ==============================
 $form = New-Object System.Windows.Forms.Form -Property @{
-    Text='MSI 全局卸载清理器 v2.2｜MSI + 控制面板统一列表（智能通道）'
+    Text='MSI 全局卸载清理器 v2.3｜MSI + 控制面板统一列表（智能通道）'
     Width=1270; Height=730; StartPosition='CenterScreen'
     Font=(New-Object System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
     MinimumSize=(New-Object System.Drawing.Size -ArgumentList @(1050,580))
@@ -352,66 +354,7 @@ $form.Add_Shown({
 })
 # 不设置 Form.AcceptButton；在实时搜索框按回车不会触发任何卸载动作。
 
-function Confirm-SelectedRows {
-    param([System.Data.DataRow[]]$Rows)
-    $confirm = New-Object System.Windows.Forms.Form -Property @{
-        Text='请确认全部选中的卸载项目';Width=930;Height=560;StartPosition='CenterParent'
-        Font=(New-Object System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
-        MinimumSize=(New-Object System.Drawing.Size -ArgumentList @(760,420))
-    }
-    $header = New-Object System.Windows.Forms.Label -Property @{
-        Dock='Top';Height=66;Padding=(New-Object System.Windows.Forms.Padding -ArgumentList @(12,10,12,5))
-        Text=("本次准备处理 $($Rows.Count) 项。MSI 项目失败后可强制清理安装登记；控制面板独有项目只执行正常卸载。`r`n已选项目包含其他筛选范围中的勾选，请逐项核对：")
-    }
-    $view = New-Object System.Windows.Forms.DataGridView -Property @{
-        Dock='Fill';ReadOnly=$true;AllowUserToAddRows=$false;AllowUserToDeleteRows=$false
-        RowHeadersVisible=$false;SelectionMode='FullRowSelect';AutoSizeColumnsMode='Fill'
-    }
-    $confirmTable = New-Object System.Data.DataTable
-    foreach ($name in @('软件名称','版本','来源','卸载方式')) { [void]$confirmTable.Columns.Add($name,[string]) }
-    foreach ($r in $Rows) {
-        [void]$confirmTable.Rows.Add([string]$r['软件名称'],[string]$r['版本'],[string]$r['来源'],[string]$r['卸载方式'])
-    }
-    $view.DataSource = $confirmTable.DefaultView
-    $buttons = New-Object System.Windows.Forms.Panel -Property @{Dock='Bottom';Height=55}
-    $yes = New-Object System.Windows.Forms.Button -Property @{Text='确认开始卸载';Width=145;Height=33;DialogResult='Yes';Top=10;Left=610;Anchor='Top,Right'}
-    $no = New-Object System.Windows.Forms.Button -Property @{Text='取消';Width=105;Height=33;DialogResult='No';Top=10;Left=765;Anchor='Top,Right'}
-    $buttons.Controls.AddRange(@($yes,$no))
-    $buttons.Add_Resize({
-        $no.Left = $buttons.ClientSize.Width - $no.Width - 14
-        $yes.Left = $no.Left - $yes.Width - 10
-    })
-    $confirm.Controls.Add($view)
-    $confirm.Controls.Add($header)
-    $confirm.Controls.Add($buttons)
-    $confirm.CancelButton = $no
-    try { return ($confirm.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::Yes) }
-    finally { $confirm.Dispose() }
-}
-
-$script:selection = @()
-$btnOk.Add_Click({
-    $rows = @($script:dt.Select('全选 = true'))
-    if ($rows.Count -eq 0) { [void](Show-Dialog '请先勾选要卸载的软件。' '尚未选择' 'OK' 'Information'); return }
-    if (-not (Confirm-SelectedRows $rows)) { return }
-    $script:selection = $rows
-    $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $form.Close()
-})
-
 # ============================== 卸载核心 ==============================
-function Invoke-Process {
-    param([string]$FileName,[string]$Arguments,[bool]$Hidden = $false)
-    try {
-        $opt = @{ FilePath=$FileName; Wait=$true; PassThru=$true; ErrorAction='Stop' }
-        if (-not [string]::IsNullOrWhiteSpace($Arguments)) { $opt['ArgumentList'] = $Arguments }
-        if ($Hidden) { $opt['WindowStyle'] = 'Hidden' }
-        $p = Start-Process @opt
-        return [pscustomobject]@{ Ok=$true; Code=[int]$p.ExitCode; Error='' }
-    }
-    catch { return [pscustomobject]@{ Ok=$false; Code=-1; Error=$_.Exception.Message } }
-}
-
 function Get-CleanTargets {
     param([System.Data.DataRow]$Row)
     if ([string]$Row['HasMsi'] -ne 'True') { throw '此项目没有 MSI UserData 记录，不允许强制清理。' }
@@ -511,36 +454,6 @@ function Invoke-ForceRegistryCleanup {
     }
 }
 
-function Invoke-MsiUninstall {
-    param([System.Data.DataRow]$Row)
-    $name = [string]$Row['软件名称']
-    $guid = [string]$Row['GUID']
-    if (-not (Test-ProductGuid $guid)) { Write-Log ("MSI GUID 不合法：$name"); return '失败（无效 GUID）' }
-    Write-Log ("MSI 卸载开始：$name；ProductCode=$guid")
-    $result = Invoke-Process 'msiexec.exe' ("/x $guid REBOOT=ReallySuppress /qn") $true
-    $code = [int]$result.Code
-    if ($result.Ok -and $code -in @(0,3010,1641)) {
-        Write-Log ("MSI 正常卸载成功：$name；退出码=$code")
-        return '正常 MSI 卸载成功'
-    }
-    Write-Log ("MSI 卸载失败：$name；退出码=$code；$($result.Error)")
-    if (-not $result.Ok) { return ('未能启动 msiexec：' + $result.Error) }
-    if ($code -eq 1602) { return '已取消（1602，不强制清理）' }
-    if ($code -eq 1618) { return '安装冲突（1618，稍后重试）' }
-
-    if ($script:autoForceOnFailure) {
-        Write-Log ("根据 INI 自动备份并强制清理：$name，退出码=$code")
-        return (Invoke-ForceRegistryCleanup $Row)
-    }
-    $text = "MSI 正常卸载失败：$name`r`n产品 GUID：$guid`r`n错误码：$code`r`n`r`n是否先备份注册表，然后强制清理这个产品的 MSI 安装登记？`r`n`r`n注意：不会自动删除程序文件、服务或驱动，也不保证修复重新安装问题。"
-    $answer = Show-Dialog $text 'MSI 卸载失败 - 是否强制清理' 'YesNo' 'Warning'
-    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-        Write-Log ("用户取消强制清理：$name")
-        return ("MSI 卸载失败（$code），未清理")
-    }
-    return (Invoke-ForceRegistryCleanup $Row)
-}
-
 function Split-UninstallCommand {
     param([string]$RawCommand)
     $command = [Environment]::ExpandEnvironmentVariables($RawCommand.Trim())
@@ -548,54 +461,409 @@ function Split-UninstallCommand {
     if ($command -match '^(.+?\.(?:exe|com))(?:\s+(.*))?$') { return @($matches[1],$matches[2]) }
     return @('','')
 }
-function Invoke-AppwizUninstall {
-    param([System.Data.DataRow]$Row)
-    $name = [string]$Row['软件名称']
-    $cmd = [string]$Row['UninstallString']
-    $isMsi = ([string]$Row['IsWindowsInstaller'] -eq 'True')
-    $guid = [string]$Row['GUID']
-    Write-Log ("控制面板卸载开始：$name；登记键=$($Row['UninstallKey'])")
-    if ($isMsi -or ($cmd -match '(?i)^\s*"?[^"\r\n]*?\bmsiexec(?:\.exe)?"?(?:\s|$)')) {
-        if (-not (Test-ProductGuid $guid)) { $guid = [regex]::Match($cmd,'\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}').Value }
-        if (-not (Test-ProductGuid $guid)) {
-            Write-Log ("控制面板 MSI 项目无法得到 ProductCode：$name")
-            return '失败（没有有效 MSI ProductCode）'
-        }
-        # 控制面板独有 MSI 安装项只进行正常交互式卸载，不调用强制清理。
-        $result = Invoke-Process 'msiexec.exe' ("/x $guid")
-    }
-    else {
-        if ([string]::IsNullOrWhiteSpace($cmd)) { Write-Log ("没有正常卸载命令：$name"); return '跳过（无卸载命令）' }
-        $parts = Split-UninstallCommand $cmd
-        if (-not $parts[0]) { Write-Log ("命令无法解析：$cmd"); return '跳过（卸载命令不支持）' }
-        $result = Invoke-Process ([string]$parts[0]) ([string]$parts[1])
-    }
-    if (-not $result.Ok) { Write-Log ("卸载器无法启动：$name；$($result.Error)"); return ('卸载器启动失败：' + $result.Error) }
-    Write-Log ("控制面板卸载器已退出：$name；退出码=$($result.Code)")
-    if ($result.Code -in @(0,3010,1641)) { return '正常卸载程序已退出（请确认结果）' }
-    return ("卸载程序返回：$($result.Code)")
+
+
+# ======================= 可视化批量卸载队列 =======================
+# 使用 WinForms Timer 轮询子进程退出状态，不在 GUI 线程使用 Start-Process -Wait。
+# 进度条表示已处理的软件数量；原生 EXE 卸载器不提供统一百分比接口。
+$script:queue = $null
+
+function Update-QueueCaption {
+    if ($null -eq $script:queue) { return }
+    $q = $script:queue
+    $q.Progress.Value = [Math]::Min($q.Rows.Count,[Math]::Max(0,$q.Completed))
+    $q.Stats.Text = ('已处理 {0}/{1} 项  |  成功 {2}  |  已清理安装登记 {3}  |  待核实 {4}  |  失败 {5}  |  跳过 {6}' -f
+        $q.Completed,$q.Rows.Count,$q.Success,$q.Cleaned,$q.Review,$q.Failed,$q.Skipped)
+    $q.Grid.Refresh()
 }
 
-# 先关闭唯一窗体；之后逐条执行智能卸载。不是两个连续的 GUI 脚本。
-if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $script:selection.Count -gt 0) {
-    $msiSelected = @($script:selection | Where-Object { $_['HasMsi'] -eq 'True' }).Count
-    Write-Log ("批量卸载开始：总数=$($script:selection.Count)；MSI=$msiSelected；控制面板独有=$($script:selection.Count-$msiSelected)")
-    $outcomes = @()
-    foreach ($item in $script:selection) {
-        $name = [string]$item['软件名称']
-        $method = if ([string]$item['HasMsi'] -eq 'True') { 'MSI' } else { '控制面板' }
-        try {
-            if ($method -eq 'MSI') { $status = Invoke-MsiUninstall $item }
-            else { $status = Invoke-AppwizUninstall $item }
-        }
-        catch { $status = '处理异常'; Write-Log ("处理异常：$name；$($_.Exception.Message)") }
-        $outcomes += [pscustomobject]@{ Name=$name; Method=$method; Status=[string]$status }
-        Write-Log ("卸载任务结果：$name / $method / $status")
+function Complete-QueueRow {
+    param([string]$Message,[string]$Category)
+    $q = $script:queue
+    if ($null -eq $q -or $q.ActiveIndex -lt 0) { return }
+    $ix = $q.ActiveIndex
+    $q.View.Rows[$ix]['执行状态'] = $Message
+    $q.Completed++
+    switch ($Category) {
+        'Success' { $q.Success++ }
+        'Cleaned' { $q.Cleaned++ }
+        'Review'  { $q.Review++ }
+        'Skipped' { $q.Skipped++ }
+        default   { $q.Failed++ }
     }
-    $resultText = @($outcomes | Select-Object -First 20 | ForEach-Object { "$($_.Name) [$($_.Method)]：$($_.Status)" }) -join "`r`n"
-    if ($outcomes.Count -gt 20) { $resultText += "`r`n……更多详情请查看本地日志" }
-    Write-Log ('批量任务结束；日志：' + $script:logPath)
-    [void](Show-Dialog ("处理完毕，共 $($outcomes.Count) 项。`r`n`r`n$resultText`r`n`r`n日志：$script:logPath") '卸载结果' 'OK' 'Information')
+    $name = [string]$q.Rows[$ix]['软件名称']
+    Write-Log ("任务 $($ix+1)/$($q.Rows.Count)：$name，$Message")
+    if ($null -ne $q.ActiveProcess) {
+        try { $q.ActiveProcess.Dispose() } catch {}
+        $q.ActiveProcess = $null
+    }
+    $q.ActiveIndex = -1
+    $q.PendingAppwiz = $false
+    $q.Continue.Visible = $false
+    Update-QueueCaption
 }
-else { Write-Log '用户关闭窗口，未执行卸载。' }
+
+function Finish-UninstallQueue {
+    $q = $script:queue
+    if ($null -eq $q -or $q.Finished) { return }
+    $q.Finished = $true
+    $q.Timer.Stop()
+    $q.Stop.Enabled = $false
+    $q.Continue.Visible = $false
+    $q.Close.Visible = $true
+    $q.Header.Text = ('批量卸载处理结束。成功 {0} 项，清理 MSI 登记 {1} 项，待核实 {2} 项，失败 {3} 项，跳过 {4} 项。' -f
+       $q.Success,$q.Cleaned,$q.Review,$q.Failed,$q.Skipped)
+    $q.Current.Text = '任务已结束。可在下方逐项查看结果，点击“关闭程序”退出。'
+    $q.Dlg.Text = 'MSI 全局卸载清理器 v2.3｜卸载结果'
+    Update-QueueCaption
+    Write-Log ('批量队列结束；日志：' + $script:logPath)
+}
+
+function Start-QueueProcess {
+    $q = $script:queue
+    if ($null -eq $q -or $q.Finished -or -not $q.Started -or $null -ne $q.ActiveProcess -or $q.ActiveIndex -ge 0) { return }
+    if ($q.StopAfterCurrent -or $q.NextIndex -ge $q.Rows.Count) {
+        if ($q.StopAfterCurrent) {
+            for ($j=$q.NextIndex; $j -lt $q.Rows.Count; $j++) {
+                $q.View.Rows[$j]['执行状态'] = '未执行（已停止后续任务）'
+                $q.Skipped++
+                $q.Completed++
+            }
+            Write-Log ('用户停止后续卸载任务；本轮正在执行的任务均已结束。')
+        }
+        Finish-UninstallQueue
+        return
+    }
+
+    $ix = $q.NextIndex
+    $q.NextIndex++
+    $q.ActiveIndex = $ix
+    $r = [System.Data.DataRow]$q.Rows[$ix]
+    $name = [string]$r['软件名称']
+    $q.View.Rows[$ix]['执行状态'] = '准备启动卸载器…'
+    $method = if ([string]$r['HasMsi'] -eq 'True') { 'MSI' } else { '控制面板' }
+    $q.ActiveMethod = $method
+    $q.Current.Text = ('正在执行 {0}/{1}：{2}  [{3}]' -f ($ix+1),$q.Rows.Count,$name,$method)
+    $q.Grid.ClearSelection()
+    if ($ix -lt $q.Grid.Rows.Count) {
+        $q.Grid.Rows[$ix].Selected = $true
+        $q.Grid.FirstDisplayedScrollingRowIndex = $ix
+    }
+    Update-QueueCaption
+
+    $filename = ''
+    $arguments = ''
+    $hidden = $false
+    if ($method -eq 'MSI') {
+        $guid = [string]$r['GUID']
+        if (-not (Test-ProductGuid $guid)) {
+            Complete-QueueRow '失败（MSI ProductCode 无效）' 'Failed'
+            return
+        }
+        $filename = 'msiexec.exe'
+        $arguments = "/x $guid REBOOT=ReallySuppress /qn"
+        $hidden = $true
+    }
+    else {
+        $rawCmd = [string]$r['UninstallString']
+        $guid = [string]$r['GUID']
+        $registeredMsi = ([string]$r['IsWindowsInstaller'] -eq 'True') -or
+            ($rawCmd -match '(?i)^\s*"?[^"\r\n]*?\bmsiexec(?:\.exe)?"?(?:\s|$)')
+        if ($registeredMsi) {
+            if (-not (Test-ProductGuid $guid)) { $guid = [regex]::Match($rawCmd,'\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}').Value }
+            if (-not (Test-ProductGuid $guid)) {
+                Complete-QueueRow '跳过（未找到有效 MSI ProductCode）' 'Skipped'
+                return
+            }
+            $filename = 'msiexec.exe'
+            $arguments = "/x $guid"
+        }
+        elseif ([string]::IsNullOrWhiteSpace($rawCmd)) {
+            Complete-QueueRow '跳过（没有登记卸载命令）' 'Skipped'
+            return
+        }
+        else {
+            $parts = @(Split-UninstallCommand $rawCmd)
+            if ($parts.Count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$parts[0])) {
+                Complete-QueueRow '跳过（卸载命令无法安全解析）' 'Skipped'
+                return
+            }
+            $filename = [string]$parts[0]
+            $arguments = if ($parts.Count -ge 2) { [string]$parts[1] } else { '' }
+        }
+    }
+
+    try {
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $filename
+        $info.Arguments = $arguments
+        $info.UseShellExecute = -not $hidden
+        if ($hidden) {
+            $info.CreateNoWindow = $true
+            $info.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        }
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $info
+        if (-not $process.Start()) { throw '卸载器未能启动。' }
+        $q.ActiveProcess = $process
+        $q.ActiveStart = Get-Date
+        $q.View.Rows[$ix]['执行状态'] = '卸载器运行中…'
+        Write-Log ("卸载任务启动：$name；通道=$method；进程ID=$($process.Id)；命令=$filename $arguments")
+    }
+    catch {
+        Write-Log ("卸载器启动失败：$name；$($_.Exception.Message)")
+        Complete-QueueRow ('启动失败：' + $_.Exception.Message) 'Failed'
+    }
+}
+
+function Check-QueueTick {
+    $q = $script:queue
+    if ($null -eq $q -or $q.Finished -or -not $q.Started) { return }
+    if ($q.InTick) { return }
+    $q.InTick = $true
+    try {
+        if ($q.PendingAppwiz) {
+            $r = [System.Data.DataRow]$q.Rows[$q.ActiveIndex]
+            $registryPath = Get-ProviderRegistryPath ([string]$r['UninstallKey'])
+            $stillPresent = ($registryPath -and (Test-Path -LiteralPath $registryPath -ErrorAction SilentlyContinue))
+            if (-not $stillPresent) {
+                Complete-QueueRow '控制面板卸载记录已移除（请核实软件状态）' 'Success'
+            }
+            elseif ((Get-Date) -ge $q.VerifyUntil) {
+                $q.Continue.Visible = $true
+                $q.Current.Text = "卸载器已退出，但注册表仍显示该程序。确认原卸载程序已结束后，点击“继续下一项”。"
+                $q.View.Rows[$q.ActiveIndex]['执行状态'] = '等待人工确认（卸载记录仍在）'
+            }
+            else {
+                $left = [Math]::Ceiling(($q.VerifyUntil-(Get-Date)).TotalSeconds)
+                $q.View.Rows[$q.ActiveIndex]['执行状态'] = "卸载器已退出，正在核对安装记录（剩余 $left 秒）"
+            }
+        }
+        elseif ($null -ne $q.ActiveProcess) {
+            $process = $q.ActiveProcess
+            if ($process.HasExited) {
+                $code = [int]$process.ExitCode
+                $row = [System.Data.DataRow]$q.Rows[$q.ActiveIndex]
+                $name = [string]$row['软件名称']
+                Write-Log ("卸载器已退出：$name；退出码=$code；通道=$($q.ActiveMethod)")
+                if ($q.ActiveMethod -eq 'MSI') {
+                    if ($code -in @(0,3010,1641)) {
+                        $status = if ($code -eq 3010) { 'MSI 卸载成功（需要重启）' } elseif ($code -eq 1641) { 'MSI 卸载成功（已发出重启请求）' } else { 'MSI 卸载成功' }
+                        Complete-QueueRow $status 'Success'
+                    }
+                    elseif ($code -eq 1602) { Complete-QueueRow '已取消（1602，不强制清理）' 'Skipped' }
+                    elseif ($code -eq 1618) { Complete-QueueRow '安装程序冲突（1618，未清理）' 'Skipped' }
+                    else {
+                        $force = $script:autoForceOnFailure
+                        if (-not $force) {
+                            $prompt = "MSI 正常卸载失败：$name`r`n退出码：$code`r`n`r`n是否先备份注册表，再强制清理该产品的 MSI 安装登记？`r`n不会自动删除软件文件、驱动或服务。"
+                            $force = ([System.Windows.Forms.MessageBox]::Show($q.Dlg,$prompt,'卸载失败：强制清理？',
+                                [System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning) -eq [System.Windows.Forms.DialogResult]::Yes)
+                        }
+                        if ($force) {
+                            $q.View.Rows[$q.ActiveIndex]['执行状态'] = '正在备份并清理 MSI 登记…'
+                            $q.Dlg.Refresh()
+                            $cleanup = [string](Invoke-ForceRegistryCleanup $row)
+                            if ($cleanup -eq '仅 MSI 安装登记已清理') { Complete-QueueRow '已强制清理 MSI 安装登记（非完整卸载）' 'Cleaned' }
+                            else { Complete-QueueRow ("卸载失败($code)；$cleanup") 'Failed' }
+                        }
+                        else { Complete-QueueRow "MSI 卸载失败($code)；未强制清理" 'Failed' }
+                    }
+                }
+                else {
+                    if ($code -in @(0,3010,1641)) {
+                        $registryPath = Get-ProviderRegistryPath ([string]$row['UninstallKey'])
+                        $stillPresent = ($registryPath -and (Test-Path -LiteralPath $registryPath -ErrorAction SilentlyContinue))
+                        if (-not $stillPresent -and $registryPath) {
+                            Complete-QueueRow '卸载记录已移除（请核实软件状态）' 'Success'
+                        }
+                        elseif (-not $registryPath) {
+                            Complete-QueueRow '卸载器已退出（没有可核对的注册表项）' 'Review'
+                        }
+                        else {
+                            try { $process.Dispose() } catch {}
+                            $q.ActiveProcess = $null
+                            $q.PendingAppwiz = $true
+                            $q.VerifyUntil = (Get-Date).AddSeconds(8)
+                            $q.View.Rows[$q.ActiveIndex]['执行状态'] = '卸载器已退出，核对安装记录中…'
+                        }
+                    }
+                    else {
+                        Complete-QueueRow "控制面板卸载器退出码 $code（未强制清理）" 'Failed'
+                    }
+                }
+            }
+            else {
+                $elapsed = [int]((Get-Date)-$q.ActiveStart).TotalSeconds
+                $q.View.Rows[$q.ActiveIndex]['执行状态'] = "卸载器运行中（$elapsed 秒）"
+            }
+        }
+        if ($q.ActiveIndex -lt 0 -and -not $q.Finished) { Start-QueueProcess }
+        Update-QueueCaption
+    }
+    catch {
+        $errorText = $_.Exception.Message
+        Write-Log ('队列轮询异常：' + $errorText)
+        # 保守处理：不因 UI 轮询异常就放弃仍在运行的卸载器并启动下一项。
+        $running = $false
+        if ($null -ne $q.ActiveProcess) {
+            try { $running = -not $q.ActiveProcess.HasExited } catch { $running = $true }
+        }
+        if ($running) {
+            $q.StopAfterCurrent = $true
+            $q.Stop.Enabled = $false
+            $q.Current.Text = '进度监控异常，停止新任务，等待当前卸载器结束。详情请查看日志。'
+        }
+        elseif ($q.ActiveIndex -ge 0) { Complete-QueueRow ('处理异常：' + $errorText) 'Failed' }
+    }
+    finally { $q.InTick = $false }
+}
+
+function Show-BatchUninstallDialog {
+    param([System.Data.DataRow[]]$Rows)
+    $dlg = New-Object System.Windows.Forms.Form -Property @{
+        Text='请确认批量卸载项目';Width=1050;Height=660;StartPosition='CenterParent'
+        Font=(New-Object System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
+        MinimumSize=(New-Object System.Drawing.Size -ArgumentList @(850,510))
+    }
+    $header = New-Object System.Windows.Forms.Label -Property @{
+        Dock='Top';Height=66;Padding=(New-Object System.Windows.Forms.Padding -ArgumentList @(12,12,12,7))
+        Text='本次待处理项目，请核对后开始卸载。'
+    }
+    # 格式字符串里的换行必须是真实回车，避免单引号输出反斜杠文字。
+    $header.Text = "本次已勾选 $($Rows.Count) 个项目。MSI 走 MSI 卸载，失败时按 INI 决定是否清理登记；控制面板独有项目走正常卸载。`r`n请核对全部项目后开始，卸载过程中本窗口会保留并实时显示进度。"
+    $grid = New-Object System.Windows.Forms.DataGridView -Property @{
+        Dock='Fill';ReadOnly=$true;AllowUserToAddRows=$false;AllowUserToDeleteRows=$false
+        RowHeadersVisible=$false;SelectionMode='FullRowSelect';MultiSelect=$false
+        AutoSizeColumnsMode='Fill';BackgroundColor='White';AllowUserToOrderColumns=$false
+    }
+    $viewTable = New-Object System.Data.DataTable
+    foreach ($name in @('软件名称','版本','来源','卸载方式','执行状态')) { [void]$viewTable.Columns.Add($name,[string]) }
+    foreach ($r in $Rows) {
+        [void]$viewTable.Rows.Add([string]$r['软件名称'],[string]$r['版本'],[string]$r['来源'],[string]$r['卸载方式'],'待处理')
+    }
+    $grid.DataSource = $viewTable.DefaultView
+    $grid.Columns['软件名称'].FillWeight = 220
+    $grid.Columns['版本'].FillWeight = 60
+    $grid.Columns['来源'].FillWeight = 95
+    $grid.Columns['卸载方式'].FillWeight = 63
+    $grid.Columns['执行状态'].FillWeight = 185
+    foreach ($column in $grid.Columns) { $column.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable }
+
+    $foot = New-Object System.Windows.Forms.Panel -Property @{Dock='Bottom';Height=148}
+    $labelCurrent = New-Object System.Windows.Forms.Label -Property @{Left=12;Top=8;AutoEllipsis=$true;Width=990;Height=25;Text='尚未开始卸载，请核对上方所有勾选的软件。'}
+    $progress = New-Object System.Windows.Forms.ProgressBar -Property @{Left=12;Top=38;Width=1000;Height=21;Minimum=0;Maximum=[Math]::Max(1,$Rows.Count);Value=0;Style='Continuous'}
+    $stats = New-Object System.Windows.Forms.Label -Property @{Left=12;Top=66;Width=990;Height=20;Text="已处理 0/$($Rows.Count) 项"}
+    $start = New-Object System.Windows.Forms.Button -Property @{Text='确认开始卸载';Left=520;Top=97;Width=150;Height=34}
+    $stop = New-Object System.Windows.Forms.Button -Property @{Text='取消';Left=680;Top=97;Width=120;Height=34}
+    $continue = New-Object System.Windows.Forms.Button -Property @{Text='继续下一项';Left=805;Top=97;Width=125;Height=34;Visible=$false}
+    $close = New-Object System.Windows.Forms.Button -Property @{Text='关闭程序';Left=805;Top=97;Width=125;Height=34;Visible=$false}
+    $foot.Controls.AddRange(@($labelCurrent,$progress,$stats,$start,$stop,$continue,$close))
+    $foot.Add_Resize({
+        $w = $foot.ClientSize.Width
+        $labelCurrent.Width = $w-24; $stats.Width=$w-24; $progress.Width=$w-24
+        $close.Left=$w-$close.Width-13
+        $continue.Left=$close.Left
+        $stop.Left=$continue.Left-$stop.Width-10
+        $start.Left=$stop.Left-$start.Width-10
+    })
+    $dlg.Controls.Add($grid)
+    $dlg.Controls.Add($header)
+    $dlg.Controls.Add($foot)
+
+    $timer = New-Object System.Windows.Forms.Timer -Property @{Interval=400}
+    $script:queue = @{
+        Dlg=$dlg; Header=$header; Grid=$grid; View=$viewTable; Progress=$progress; Stats=$stats
+        Current=$labelCurrent; Start=$start; Stop=$stop; Continue=$continue; Close=$close; Timer=$timer
+        Rows=@($Rows); NextIndex=0; ActiveIndex=-1; ActiveProcess=$null; ActiveMethod=''; ActiveStart=Get-Date
+        PendingAppwiz=$false; VerifyUntil=Get-Date; Started=$false; StopAfterCurrent=$false
+        Finished=$false; Completed=0; Success=0; Cleaned=0; Review=0; Failed=0; Skipped=0; InTick=$false
+    }
+    $start.Add_Click({
+        $q = $script:queue
+        if ($q.Started) { return }
+        $q.Started=$true
+        $script:batchActuallyStarted=$true
+        $q.Start.Enabled=$false
+        $q.Stop.Text='停止后续任务'
+        $q.Dlg.Text='MSI 全局卸载清理器 v2.3｜正在批量卸载'
+        $q.Header.Text='批量卸载进行中：程序将逐项启动卸载器，下面实时记录处理结果。停止后续任务不会结束当前卸载器。'
+        Write-Log ("批量卸载开始：共 $($q.Rows.Count) 项，自动强制清理=$([int]$script:autoForceOnFailure)")
+        Start-QueueProcess
+        $q.Timer.Start()
+    })
+    $stop.Add_Click({
+        $q = $script:queue
+        if (-not $q.Started) { $q.Dlg.Close(); return }
+        if ($q.StopAfterCurrent) { return }
+        $choice = [System.Windows.Forms.MessageBox]::Show($q.Dlg,
+            '是否停止尚未执行的卸载任务？正在运行的卸载器不会被结束，待它执行完毕后队列停止。',
+            '停止后续任务',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($choice -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $q.StopAfterCurrent = $true
+            $q.Stop.Enabled = $false
+            $q.Current.Text = '已请求停止：正在等待当前卸载器完成…'
+            # 原生卸载器已经退出但未能核实记录的情形，可直接结束该项目并停止余下任务。
+            if ($q.PendingAppwiz) {
+                Complete-QueueRow '卸载器已退出（未核实；用户停止后续任务）' 'Review'
+                Start-QueueProcess
+            }
+            elseif ($q.ActiveIndex -lt 0) { Start-QueueProcess }
+        }
+    })
+    $continue.Add_Click({
+        $q = $script:queue
+        if (-not $q.PendingAppwiz -or $q.ActiveIndex -lt 0) { return }
+        $r = [System.Data.DataRow]$q.Rows[$q.ActiveIndex]
+        $key = Get-ProviderRegistryPath ([string]$r['UninstallKey'])
+        $exists = ($key -and (Test-Path -LiteralPath $key -ErrorAction SilentlyContinue))
+        if ($exists) {
+            $reply = [System.Windows.Forms.MessageBox]::Show($q.Dlg,
+                "该软件的控制面板卸载登记仍然存在。只有在确认原生卸载器已完成后才建议继续。`r`n是否继续队列，并将此项标记为“待核实”？",
+                '确认卸载器状态',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($reply -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            Complete-QueueRow '卸载器已退出（卸载登记仍在，待核实）' 'Review'
+        }
+        else { Complete-QueueRow '卸载记录已移除（请核实软件状态）' 'Success' }
+        Start-QueueProcess
+    })
+    $close.Add_Click({ $script:queue.Dlg.Close() })
+    $timer.Add_Tick({ Check-QueueTick })
+    $dlg.Add_FormClosing({
+        $q = $script:queue
+        if ($null -ne $q -and $q.Started -and -not $q.Finished) {
+            $_.Cancel=$true
+            [void][System.Windows.Forms.MessageBox]::Show($q.Dlg,
+                '卸载任务仍在进行。请先点击“停止后续任务”，等待当前卸载器结束，再关闭窗口。',
+                '正在卸载',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information)
+        }
+    })
+    try { [void]$dlg.ShowDialog($form) }
+    finally {
+        $timer.Stop(); $timer.Dispose()
+        if ($null -ne $script:queue.ActiveProcess) { try { $script:queue.ActiveProcess.Dispose() } catch {} }
+        $dlg.Dispose()
+        $script:queue=$null
+    }
+}
+
+$btnOk.Add_Click({
+    $rows = @($script:dt.Select('全选 = true'))
+    if ($rows.Count -eq 0) { [void](Show-Dialog '请先勾选要卸载的软件。' '尚未选择' 'OK' 'Information'); return }
+    $script:batchActuallyStarted=$false
+    Show-BatchUninstallDialog $rows
+    # 确认对话框一旦启动卸载并最终关闭，原主窗口也关闭；取消确认则返回列表。
+    if ($null -eq $script:queue -and $script:batchActuallyStarted) { $form.Close() }
+})
+
+# 记录是否真正开始任务，以区分“取消确认”与“处理完毕后关闭”。
+# 在对话框中开始时设置，在对话框关闭后由主窗体点击事件读取。
+$script:batchActuallyStarted=$false
+
+[void]$form.ShowDialog()
+Write-Log 'GUI 已关闭。'
 $form.Dispose()
+
+# 对于从 irm URL | iex 运行的独立 Windows PowerShell 5.1 控制台，按用户要求结束该会话。
+# 运行本地 .ps1 时不主动退出用户原有的 PowerShell 会话。
+if ($script:closeConsoleOnExit) { [Environment]::Exit(0) }
