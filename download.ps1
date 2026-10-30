@@ -1,65 +1,82 @@
 <#
 .SYNOPSIS
-    MSI 全局卸载清理器 v2.1.1（MSI / appwiz.cpl 双通道）
+    MSI 全局卸载清理器 v2.2 - 统一清单，智能卸载通道
 .DESCRIPTION
-    默认显示 MSI Installer UserData 中的产品；appwiz.cpl 按钮显示“程序和功能”卸载注册表项目。
-    两个模式完全隔离：MSI 卸载失败才允许逐项确认并备份注册表后清理；
-    appwiz.cpl 仅使用软件注册的正常卸载方式，不进行任何强制注册表清理。
+    显示全部 = MSI Installer UserData + 控制面板卸载记录，按 MSI ProductCode 精确关联去重。
+    同一个 MSI 产品两种来源仅显示一行，按 MSI 通道卸载；仅控制面板记录走注册卸载程序。
+    MSI 卸载失败时可询问或按本地 INI 自动强制清理已备份的产品安装登记项。
 .NOTES
-    适用于 Windows PowerShell 5.1；以管理员运行 64 位 PowerShell。
-    点击“显示全部”返回默认 MSI 列表；模式切换清空全部勾选。
-    强制清理仅删除有限的安装登记项，不等于卸载软件文件，也不保证修复安装器。
+    Windows PowerShell 5.1 (64-bit) + 管理员权限；可通过 irm URL | iex 运行。
+    强制清理仅移除特定 MSI 安装登记信息，不代表删除软件文件或修复所有安装问题。
 #>
 
-# 通过 irm ... | iex 执行时：下载完成后先清屏，再打开窗口。
+# 远程 irm ... | iex 时自动清屏；不向终端打印正常运行日志。
 Clear-Host -ErrorAction SilentlyContinue
-
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Data
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# 环境校验：避免 32 位注册表重定向造成误操作
+function Show-Dialog {
+    param([string]$Text, [string]$Title = 'MSI 全局卸载清理器 v2.2', [string]$Buttons = 'OK', [string]$Icon = 'Information')
+    return [System.Windows.Forms.MessageBox]::Show($Text,$Title,([System.Windows.Forms.MessageBoxButtons]$Buttons),([System.Windows.Forms.MessageBoxIcon]$Icon))
+}
+
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
-    [System.Windows.Forms.MessageBox]::Show('请使用 64 位 Windows PowerShell 运行，避免读取或清理错误的注册表视图。','运行环境错误','OK','Error') | Out-Null
+    [void](Show-Dialog '请使用 64 位 Windows PowerShell 运行，以免注册表重定向造成错误。' '运行环境错误' 'OK' 'Error')
     return
 }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$principal = New-Object Security.Principal.WindowsPrincipal -ArgumentList @($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    [System.Windows.Forms.MessageBox]::Show('请右键以管理员身份运行 Windows PowerShell，再启动本脚本。','需要管理员权限','OK','Warning') | Out-Null
+    [void](Show-Dialog '请以管理员身份打开 64 位 Windows PowerShell，再运行该脚本。' '需要管理员权限' 'OK' 'Warning')
     return
 }
 
 $script:baseDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MSIUninstallCleaner'
 $logDir = Join-Path $script:baseDir 'Logs'
 [void][IO.Directory]::CreateDirectory($logDir)
+$script:logPath = Join-Path $logDir ('Uninstall_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 $script:logFailureReported = $false
-$script:logPath = Join-Path $logDir ('Uninstall_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-
 function Write-Log {
     param([string]$Message)
     $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    # 仅写入本地文件；不向 PowerShell 终端打印运行日志。
     try { Add-Content -LiteralPath $script:logPath -Value $line -Encoding UTF8 -ErrorAction Stop }
     catch {
-        # 仅在日志不可写时提示一次，不将错误消息刷到控制台。
         if (-not $script:logFailureReported) {
             $script:logFailureReported = $true
-            [void][System.Windows.Forms.MessageBox]::Show(
-                ('无法写入日志文件：' + $script:logPath + [Environment]::NewLine + $_.Exception.Message),
-                '日志保存失败',
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            )
+            [void](Show-Dialog ('无法写入日志：' + $script:logPath + "`r`n" + $_.Exception.Message) '日志保存失败' 'OK' 'Warning')
         }
     }
 }
 
-function Show-Dialog {
-    param([string]$Text, [string]$Title = 'MSI 全局卸载清理器', [string]$Buttons = 'OK', [string]$Icon = 'Information')
-    return [System.Windows.Forms.MessageBox]::Show($Text,$Title,([System.Windows.Forms.MessageBoxButtons]$Buttons),([System.Windows.Forms.MessageBoxIcon]$Icon))
+# INI 放在固定的本地用户配置目录，适用于 GitHub irm | iex 单文件运行。
+$script:iniPath = Join-Path $script:baseDir 'config.ini'
+$script:autoForceOnFailure = $false
+$iniTemplate = @'
+[MSI]
+; MSI 卸载失败后是否自动强制清理安装登记记录
+; 0=失败后逐项弹窗询问（默认，推荐）
+; 1=真正卸载失败后自动清理（但 1602 用户取消、1618 安装冲突不清理）
+; 强制清理前始终备份目标注册表；备份失败则不删除
+AutoForceOnFailure=0
+'@
+try {
+    if (-not (Test-Path -LiteralPath $script:iniPath)) {
+        [IO.File]::WriteAllText($script:iniPath, $iniTemplate, (New-Object System.Text.UTF8Encoding -ArgumentList @($true)))
+    }
+    $section = ''
+    foreach ($line in [IO.File]::ReadAllLines($script:iniPath,[Text.Encoding]::UTF8)) {
+        $item = $line.Trim()
+        if ($item -match '^\s*\[([^\]]+)\]\s*$') { $section = $matches[1].Trim(); continue }
+        if ($item -match '^\s*[;#]' -or $item.Length -eq 0) { continue }
+        if ($section -ieq 'MSI' -and $item -match '^AutoForceOnFailure\s*=\s*([01])\s*(?:[;#].*)?$') {
+            $script:autoForceOnFailure = ($matches[1] -eq '1')
+        }
+    }
 }
+catch { Write-Log ('无法读取或生成 INI，采用人工确认模式：' + $_.Exception.Message) }
+Write-Log ('启动 v2.2；AutoForceOnFailure=' + [int]$script:autoForceOnFailure)
 
 function Convert-PackedGuid {
     param([string]$Packed)
@@ -68,7 +85,6 @@ function Convert-PackedGuid {
     return ('{' + (-join $p[7..0]) + '-' + (-join $p[11..8]) + '-' + (-join $p[15..12]) + '-' +
         (-join $p[17,16,19,18]) + '-' + (-join $p[21,20,23,22,25,24,27,26,29,28,31,30]) + '}')
 }
-
 function Get-NativeRegistryPath {
     param([string]$Path)
     $s = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::','' -replace '^Registry::',''
@@ -76,7 +92,6 @@ function Get-NativeRegistryPath {
     $s = $s -replace '^HKEY_LOCAL_MACHINE\\','HKLM\' -replace '^HKEY_CURRENT_USER\\','HKCU\'
     return $s
 }
-
 function Get-ProviderRegistryPath {
     param([string]$Path)
     $s = Get-NativeRegistryPath $Path
@@ -84,35 +99,44 @@ function Get-ProviderRegistryPath {
     if ($s -match '^HKCU\\') { return ('Registry::HKEY_CURRENT_USER\' + $s.Substring(5)) }
     return ''
 }
+function Test-ProductGuid {
+    param([string]$Value)
+    return ($Value -match '^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$')
+}
 
 function New-Table {
     $t = New-Object System.Data.DataTable
     [void]$t.Columns.Add('全选',[bool])
-    foreach ($n in @('软件名称','版本','发行商','安装日期','GUID','模式','PackedGUID','UserPath','UninstallKey','UninstallString','IsWindowsInstaller')) {
+    foreach ($n in @('软件名称','版本','发行商','安装日期','来源','卸载方式','GUID','PackedGUID','UserPath','UninstallKey','UninstallString','HasMsi','HasAppwiz','IsWindowsInstaller')) {
         [void]$t.Columns.Add($n,[string])
     }
     return ,$t
 }
-
 $script:dt = New-Table
-$script:mode = 'MSI'
+$script:msiByGuid = @{}
+$script:scope = 'ALL'
 
-# 默认 MSI 清单保留原始 UserData 来源，避免与控制面板卸载注册表混合
 function Add-MsiRows {
-    $registry = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\*\Products\*\InstallProperties'
-    $items = @(Get-ItemProperty -Path $registry -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | Sort-Object DisplayName)
+    $path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\*\Products\*\InstallProperties'
+    $items = @(Get-ItemProperty -Path $path -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | Sort-Object DisplayName)
     foreach ($i in $items) {
         $userPath = Split-Path -Path $i.PSPath -Parent
         $packed = Split-Path -Path $userPath -Leaf
         if ($packed -notmatch '^[0-9A-Fa-f]{32}$') { continue }
-        # 以 PackedGUID 还原的产品码为准，避免 UninstallString 指向其他产品时发生误卸载。
         $guid = Convert-PackedGuid $packed
-        [void]$script:dt.Rows.Add($false,[string]$i.DisplayName,[string]$i.DisplayVersion,[string]$i.Publisher,
-            [string]$i.InstallDate,$guid,'MSI',$packed,$userPath,'',[string]$i.UninstallString,'True')
+        if (-not (Test-ProductGuid $guid)) { continue }
+        if ($script:msiByGuid.ContainsKey($guid)) {
+            Write-Log ('MSI UserData 重复 ProductCode，保留第一条显示：' + $guid + ' / ' + $userPath)
+            continue
+        }
+        $row = $script:dt.Rows.Add($false,[string]$i.DisplayName,[string]$i.DisplayVersion,
+            [string]$i.Publisher,[string]$i.InstallDate,'MSI','MSI', $guid,$packed,$userPath,
+            '',[string]$i.UninstallString,'True','False','True')
+        $script:msiByGuid[$guid] = $row
     }
 }
 
-# appwiz.cpl 视图：HKLM 64/32 位 + HKCU，忽略控制面板通常不展示的系统组件/补丁项。
+# 按卸载键的 ProductCode 严格关联；不按名称或发行商推断 MSI 是否同一产品。
 function Add-AppwizRows {
     $roots = @(
         @{ Hive=[Microsoft.Win32.RegistryHive]::LocalMachine; View=[Microsoft.Win32.RegistryView]::Registry64; Prefix='HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' }
@@ -136,20 +160,34 @@ function Add-AppwizRows {
                     $name = [string]$sub.GetValue('DisplayName','')
                     if ([string]::IsNullOrWhiteSpace($name)) { continue }
                     if ([string]$sub.GetValue('SystemComponent','0') -eq '1') { continue }
-                    if (-not [string]::IsNullOrEmpty([string]$sub.GetValue('ParentKeyName',''))) { continue }
-                    if (-not [string]::IsNullOrEmpty([string]$sub.GetValue('ReleaseType',''))) { continue }
+                    if (-not [string]::IsNullOrWhiteSpace([string]$sub.GetValue('ParentKeyName',''))) { continue }
+                    if (-not [string]::IsNullOrWhiteSpace([string]$sub.GetValue('ReleaseType',''))) { continue }
                     $isMsi = ([string]$sub.GetValue('WindowsInstaller','0') -eq '1')
                     $uninst = [string]$sub.GetValue('UninstallString','')
                     $guid = [regex]::Match($keyName,'^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$').Value
+                    $isMsiCommand = ($uninst -match '(?i)^\s*"?[^"\r\n]*?\bmsiexec(?:\.exe)?"?(?:\s|$)')
+                    $uninstallKey = $r.Prefix + '\' + $keyName
+                    if ($guid -and $script:msiByGuid.ContainsKey($guid) -and ($isMsi -or $isMsiCommand)) {
+                        $existing = [System.Data.DataRow]$script:msiByGuid[$guid]
+                        $existing['HasAppwiz'] = 'True'
+                        $existing['来源'] = 'MSI + 控制面板'
+                        if ([string]::IsNullOrWhiteSpace([string]$existing['UninstallKey'])) {
+                            $existing['UninstallKey'] = $uninstallKey
+                        }
+                        Write-Log ('已合并相同 MSI ProductCode：' + $guid + ' / ' + $name)
+                        continue
+                    }
+                    # 未找到真实 MSI UserData 产品记录的控制面板项目，仍只走控制面板正常卸载通道。
                     [void]$script:dt.Rows.Add($false,$name,[string]$sub.GetValue('DisplayVersion',''),
                         [string]$sub.GetValue('Publisher',''),[string]$sub.GetValue('InstallDate',''),
-                        $guid,'appwiz','','',($r.Prefix + '\' + $keyName),$uninst,[string]$isMsi)
+                        '控制面板','正常卸载',$guid,'','',$uninstallKey,$uninst,
+                        'False','True',[string]$isMsi)
                 }
                 catch { Write-Log ('读取控制面板项目失败：' + $keyName + ' / ' + $_.Exception.Message) }
                 finally { if ($null -ne $sub) { $sub.Close() } }
             }
         }
-        catch { Write-Log ('读取注册表失败：' + $r.Prefix + ' / ' + $_.Exception.Message) }
+        catch { Write-Log ('读取卸载注册表失败：' + $r.Prefix + ' / ' + $_.Exception.Message) }
         finally {
             if ($null -ne $uninstall) { $uninstall.Close() }
             if ($null -ne $base) { $base.Close() }
@@ -157,109 +195,107 @@ function Add-AppwizRows {
     }
 }
 
-Write-Log '启动程序：加载 MSI 和控制面板信息。'
+Write-Log '开始读取 MSI 和控制面板程序。'
 Add-MsiRows
 Add-AppwizRows
-$msiCount = @($script:dt.Select("模式 = 'MSI'")).Count
-$appwizCount = @($script:dt.Select("模式 = 'appwiz'")).Count
-Write-Log ("读取完成：MSI $msiCount 项，appwiz.cpl $appwizCount 项。")
+$msiCount = @($script:dt.Select("HasMsi = 'True'")).Count
+$appwizCount = @($script:dt.Select("HasAppwiz = 'True'")).Count
+$bothCount = @($script:dt.Select("HasMsi = 'True' AND HasAppwiz = 'True'")).Count
+Write-Log ("读取完毕：MSI=$msiCount，控制面板=$appwizCount，合并交集=$bothCount，统一行数=$($script:dt.Rows.Count)")
 
-# ============================== 图形界面 ==============================
+# ============================== GUI ==============================
 $form = New-Object System.Windows.Forms.Form -Property @{
-    Text='MSI 全局卸载清理器 v2.1.1｜MSI 强制清理 / appwiz.cpl 正常卸载（独立通道）'
-    Width=1190; Height=700; StartPosition='CenterScreen'; Font=(New-Object -TypeName System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
-    MinimumSize=(New-Object -TypeName System.Drawing.Size -ArgumentList @(1000,560))
+    Text='MSI 全局卸载清理器 v2.2｜MSI + 控制面板统一列表（智能通道）'
+    Width=1270; Height=730; StartPosition='CenterScreen'
+    Font=(New-Object System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
+    MinimumSize=(New-Object System.Drawing.Size -ArgumentList @(1050,580))
 }
-# 使用三行表格布局让顶部、列表、底部各占独立的空间，杜绝 Dock=Fill 覆盖表头。
-$pTop = New-Object System.Windows.Forms.Panel -Property @{ Dock='Fill'; Margin=[System.Windows.Forms.Padding]::Empty }
-$lbl = New-Object System.Windows.Forms.Label -Property @{Text='实时搜索：'; Left=12; Top=12; AutoSize=$true}
-$txt = New-Object System.Windows.Forms.TextBox -Property @{Left=85; Top=8; Width=315; Height=25}
-$lblMode = New-Object System.Windows.Forms.Label -Property @{Text='当前：MSI 安装记录（可强制清理）'; Left=425; Top=12; Width=440; Height=22; ForeColor='DarkBlue'}
-$lblCnt = New-Object System.Windows.Forms.Label -Property @{Text='已勾选：0 项'; AutoSize=$true; Left=860; Top=12; ForeColor='Blue'; Anchor='Top,Right'}
+$pTop = New-Object System.Windows.Forms.Panel -Property @{Dock='Fill';Margin=[System.Windows.Forms.Padding]::Empty}
+$lbl = New-Object System.Windows.Forms.Label -Property @{Text='实时搜索：';Left=12;Top=12;AutoSize=$true}
+$txt = New-Object System.Windows.Forms.TextBox -Property @{Left=85;Top=8;Width=350;Height=26}
+$lblMode = New-Object System.Windows.Forms.Label -Property @{Text='当前：显示全部（MSI + 控制面板，已去重）';Left=455;Top=12;Width=590;Height=23;ForeColor='DarkBlue'}
+$lblCnt = New-Object System.Windows.Forms.Label -Property @{Text='已勾选：0 项';AutoSize=$true;ForeColor='Blue';Left=1060;Top=12}
 $pTop.Controls.AddRange(@($lbl,$txt,$lblMode,$lblCnt))
 
-# 同一行自动布置快捷按钮；便于以后增删关键词
 $x = 12
 $quickButtons = @{}
-foreach ($spec in @(@('Autodesk',85),@('VBA',55),@('SolidWorks',100),@('C++',60),@('Aspen',70))) {
+foreach ($spec in @(@('Autodesk',87),@('VBA',58),@('SolidWorks',103),@('C++',64),@('Aspen',75))) {
     $name = [string]$spec[0]
-    $button = New-Object System.Windows.Forms.Button -Property @{Text=$name; Left=$x; Top=43; Width=[int]$spec[1]; Height=29}
+    $button = New-Object System.Windows.Forms.Button -Property @{Text=$name;Left=$x;Top=43;Width=[int]$spec[1];Height=29}
     $pTop.Controls.Add($button)
     $quickButtons[$name] = $button
     $x += [int]$spec[1] + 8
 }
-$btnApp = New-Object System.Windows.Forms.Button -Property @{Text='appwiz.cpl'; Left=$x; Top=43; Width=105; Height=29}
-$x += 113
-$btnR = New-Object System.Windows.Forms.Button -Property @{Text='显示全部 (MSI)'; Left=$x; Top=43; Width=130; Height=29}
-$pTop.Controls.AddRange(@($btnApp,$btnR))
+$btnMsi = New-Object System.Windows.Forms.Button -Property @{Text='MSI';Left=$x;Top=43;Width=66;Height=29}
+$x += 74
+$btnApp = New-Object System.Windows.Forms.Button -Property @{Text='appwiz.cpl';Left=$x;Top=43;Width=107;Height=29}
+$x += 115
+$btnAll = New-Object System.Windows.Forms.Button -Property @{Text='显示全部';Left=$x;Top=43;Width=98;Height=29}
+$pTop.Controls.AddRange(@($btnMsi,$btnApp,$btnAll))
 
-$pBot = New-Object System.Windows.Forms.Panel -Property @{Dock='Fill'; Margin=[System.Windows.Forms.Padding]::Empty}
-$btnClr = New-Object System.Windows.Forms.Button -Property @{Text='清空已选'; Left=12; Top=9; Width=120; Height=32}
-$btnOk = New-Object System.Windows.Forms.Button -Property @{Text='开始 MSI 卸载'; Width=220; Height=34; Top=9; Anchor='Top,Right'}
-$btnOk.Left = 750 # 初始位置由下面 pBot.Resize 根据底栏可用宽度重新计算
+$pBot = New-Object System.Windows.Forms.Panel -Property @{Dock='Fill';Margin=[System.Windows.Forms.Padding]::Empty}
+$btnClr = New-Object System.Windows.Forms.Button -Property @{Text='清空已选';Left=12;Top=9;Width=120;Height=34}
+$btnOk = New-Object System.Windows.Forms.Button -Property @{Text='开始卸载（智能通道）';Width=240;Height=34;Top=9;Left=950}
 $pBot.Controls.AddRange(@($btnClr,$btnOk))
-
 $dgv = New-Object System.Windows.Forms.DataGridView -Property @{
-    Dock='Fill'; DataSource=$script:dt.DefaultView; AllowUserToAddRows=$false; AllowUserToDeleteRows=$false;
-    ReadOnly=$true; RowHeadersVisible=$false; SelectionMode='FullRowSelect'; MultiSelect=$false;
-    AutoSizeColumnsMode='Fill'; BackgroundColor='White'; AllowUserToOrderColumns=$true
+    Dock='Fill';DataSource=$script:dt.DefaultView;AllowUserToAddRows=$false;AllowUserToDeleteRows=$false
+    ReadOnly=$true;RowHeadersVisible=$false;SelectionMode='FullRowSelect';MultiSelect=$false
+    AutoSizeColumnsMode='Fill';BackgroundColor='White';AllowUserToOrderColumns=$true
 }
-# 使用 TableLayoutPanel 彻底隔离顶部筛选区、DataGridView 和底部操作区。
-# 与把多个 Dock 控件直接加入 Form 不同，表格布局不会让 DataGridView 的表头被顶部按钮遮盖。
-$mainLayout = New-Object System.Windows.Forms.TableLayoutPanel -Property @{
-    Dock='Fill'; ColumnCount=1; RowCount=3; Padding=[System.Windows.Forms.Padding]::Empty; Margin=[System.Windows.Forms.Padding]::Empty
-}
-[void]$mainLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList @([System.Windows.Forms.SizeType]::Percent,100)))
-[void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList @([System.Windows.Forms.SizeType]::Absolute,90)))
-[void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList @([System.Windows.Forms.SizeType]::Percent,100)))
-[void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList @([System.Windows.Forms.SizeType]::Absolute,53)))
 $dgv.Margin = [System.Windows.Forms.Padding]::Empty
-$mainLayout.Controls.Add($pTop,0,0)
-$mainLayout.Controls.Add($dgv,0,1)
-$mainLayout.Controls.Add($pBot,0,2)
-$form.Controls.Add($mainLayout)
-
-# 状态信息按顶部面板实际宽度对齐，而不是使用固定 x=955（高 DPI 下容易跑出右边界）。
+$layout = New-Object System.Windows.Forms.TableLayoutPanel -Property @{
+    Dock='Fill';ColumnCount=1;RowCount=3;Padding=[System.Windows.Forms.Padding]::Empty;Margin=[System.Windows.Forms.Padding]::Empty
+}
+[void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList @([System.Windows.Forms.SizeType]::Percent,100)))
+[void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList @([System.Windows.Forms.SizeType]::Absolute,90)))
+[void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList @([System.Windows.Forms.SizeType]::Percent,100)))
+[void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList @([System.Windows.Forms.SizeType]::Absolute,54)))
+$layout.Controls.Add($pTop,0,0)
+$layout.Controls.Add($dgv,0,1)
+$layout.Controls.Add($pBot,0,2)
+$form.Controls.Add($layout)
 $alignHeader = {
-    $lblCnt.Left = [Math]::Max(730, $pTop.ClientSize.Width - $lblCnt.PreferredWidth - 16)
-    $lblMode.Width = [Math]::Max(290, $lblCnt.Left - $lblMode.Left - 12)
+    $lblCnt.Left = [Math]::Max(850, $pTop.ClientSize.Width - $lblCnt.PreferredWidth - 18)
+    $lblMode.Width = [Math]::Max(310, $lblCnt.Left - $lblMode.Left - 14)
 }
 $pTop.Add_Resize($alignHeader)
-$pBot.Add_Resize({
-    $btnOk.Left = [Math]::Max(145, $pBot.ClientSize.Width - $btnOk.Width - 15)
-})
+$pBot.Add_Resize({ $btnOk.Left = [Math]::Max(150,$pBot.ClientSize.Width - $btnOk.Width - 15) })
 
 $updateCount = {
-    $total = @($script:dt.Select("全选 = true AND 模式 = '$script:mode'")).Count
+    $total = @($script:dt.Select('全选 = true')).Count
     $lblCnt.Text = "已勾选：$total 项"
     $dgv.Refresh()
 }
-
 function Set-Filter {
     $keyword = $txt.Text
     $safe = $keyword.Replace("'","''").Replace('[','[[]').Replace(']','[]]').Replace('%','[%]').Replace('*','[*]')
-    $where = "[模式] = '$script:mode'"
-    if ($keyword.Length -gt 0) { $where += " AND ([软件名称] LIKE '%$safe%' OR [发行商] LIKE '%$safe%')" }
-    try { $script:dt.DefaultView.RowFilter = $where }
-    catch { $script:dt.DefaultView.RowFilter = "[模式] = '$script:mode'"; Write-Log ('搜索条件无效：' + $_.Exception.Message) }
-}
-
-function Switch-Mode {
-    param([string]$Target)
-    if ($script:mode -ne $Target) {
-        foreach ($row in $script:dt.Select('全选 = true')) { $row['全选'] = $false }
-        $script:mode = $Target
+    $scopeFilter = switch ($script:scope) {
+        'MSI'   { "[HasMsi] = 'True'" }
+        'APP'   { "[HasAppwiz] = 'True'" }
+        default { '' }
     }
+    $searchFilter = if ($keyword.Length -gt 0) {
+        "([软件名称] LIKE '%$safe%' OR [发行商] LIKE '%$safe%')"
+    } else { '' }
+    $filter = @($scopeFilter,$searchFilter) | Where-Object { $_ }
+    try { $script:dt.DefaultView.RowFilter = ($filter -join ' AND ') }
+    catch { $script:dt.DefaultView.RowFilter = $scopeFilter; Write-Log ('搜索条件不支持，已恢复范围筛选：' + $_.Exception.Message) }
+}
+function Switch-Scope {
+    param([string]$Target)
+    $script:scope = $Target
     $txt.Text = ''
     if ($Target -eq 'MSI') {
-        $lblMode.Text = '当前：MSI 安装记录（卸载失败可选强制清理）'
+        $lblMode.Text = '当前：仅 MSI 安装记录（失败后可强制清理）'
         $lblMode.ForeColor = 'DarkBlue'
-        $btnOk.Text = '开始 MSI 卸载'
+    }
+    elseif ($Target -eq 'APP') {
+        $lblMode.Text = '当前：仅控制面板项目（MSI 交集仍走 MSI）'
+        $lblMode.ForeColor = 'DarkGreen'
     }
     else {
-        $lblMode.Text = '当前：appwiz.cpl 控制面板程序（仅正常卸载）'
-        $lblMode.ForeColor = 'DarkGreen'
-        $btnOk.Text = '开始正常卸载'
+        $lblMode.Text = '当前：显示全部（MSI + 控制面板，已去重）'
+        $lblMode.ForeColor = 'DarkBlue'
     }
     Set-Filter
     & $updateCount
@@ -273,83 +309,104 @@ $dgv.Add_CellMouseDown({
 })
 $dgv.Add_ColumnHeaderMouseClick({
     if ($_.ColumnIndex -eq 0) {
-        $rows = @($script:dt.DefaultView | ForEach-Object { $_.Row })
-        if ($rows.Count -gt 0) {
-            $newValue = (@($rows | Where-Object { -not [bool]$_['全选'] }).Count -gt 0)
-            foreach ($row in $rows) { $row['全选'] = $newValue }
+        $visible = @($script:dt.DefaultView | ForEach-Object { $_.Row })
+        if ($visible.Count -gt 0) {
+            $value = (@($visible | Where-Object { -not [bool]$_['全选'] }).Count -gt 0)
+            foreach ($item in $visible) { $item['全选'] = $value }
             & $updateCount
         }
     }
 })
 $dgv.Add_RowPrePaint({
     if ($_.RowIndex -ge 0 -and $null -ne $dgv.Rows[$_.RowIndex].DataBoundItem) {
-        $row = $dgv.Rows[$_.RowIndex]
-        $checked = [bool]$row.DataBoundItem.Row['全选']
-        $row.DefaultCellStyle.BackColor = if ($checked) {[System.Drawing.Color]::FromArgb(210,238,255)} else {[System.Drawing.Color]::White}
-        $row.DefaultCellStyle.SelectionBackColor = if ($checked) {[System.Drawing.Color]::FromArgb(145,205,255)} else {[System.Drawing.Color]::FromArgb(235,235,235)}
-        $row.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::Black
+        $viewRow = $dgv.Rows[$_.RowIndex]
+        $checked = [bool]$viewRow.DataBoundItem.Row['全选']
+        $viewRow.DefaultCellStyle.BackColor = if ($checked) {[Drawing.Color]::FromArgb(210,238,255)} else {[Drawing.Color]::White}
+        $viewRow.DefaultCellStyle.SelectionBackColor = if ($checked) {[Drawing.Color]::FromArgb(145,205,255)} else {[Drawing.Color]::FromArgb(235,235,235)}
+        $viewRow.DefaultCellStyle.SelectionForeColor = [Drawing.Color]::Black
     }
 })
 $txt.Add_TextChanged({ Set-Filter })
 foreach ($key in @($quickButtons.Keys)) {
-    # GetNewClosure 确保各按钮不会全部指向最后一个关键词
     $word = $key
     $quickButtons[$key].Add_Click({ $txt.Text = $word; $txt.Focus() }.GetNewClosure())
 }
-$btnApp.Add_Click({ Switch-Mode 'appwiz'; $txt.Focus() })
-$btnR.Add_Click({ Switch-Mode 'MSI'; $txt.Focus() })
+$btnMsi.Add_Click({ Switch-Scope 'MSI'; $txt.Focus() })
+$btnApp.Add_Click({ Switch-Scope 'APP'; $txt.Focus() })
+$btnAll.Add_Click({ Switch-Scope 'ALL'; $txt.Focus() })
 $btnClr.Add_Click({
-    foreach ($row in $script:dt.Select('全选 = true')) { $row['全选'] = $false }
+    foreach ($item in $script:dt.Select('全选 = true')) { $item['全选'] = $false }
     & $updateCount
 })
 $form.Add_Shown({
-    # Windows DPI/字体缩放后依据实际按钮尺寸分配行高，防止 125%/150% 缩放时剪裁。
-    $mainLayout.RowStyles[0].Height = [Math]::Max(90, $btnR.Bottom + 15)
-    $mainLayout.RowStyles[2].Height = [Math]::Max(53, $btnOk.Bottom + 10)
+    $layout.RowStyles[0].Height = [Math]::Max(90,$btnAll.Bottom + 15)
+    $layout.RowStyles[2].Height = [Math]::Max(54,$btnOk.Bottom + 10)
     & $alignHeader
-    $dgv.Columns['全选'].FillWeight = 27
-    $dgv.Columns['软件名称'].FillWeight = 230
-    $dgv.Columns['版本'].FillWeight = 66
-    $dgv.Columns['发行商'].FillWeight = 135
-    $dgv.Columns['安装日期'].FillWeight = 70
-    $dgv.Columns['GUID'].FillWeight = 150
-    foreach ($col in @('模式','PackedGUID','UserPath','UninstallKey','UninstallString','IsWindowsInstaller')) {
-        $dgv.Columns[$col].Visible = $false
+    $weights = @{ '全选'=28; '软件名称'=230; '版本'=65; '发行商'=145; '安装日期'=75; '来源'=116; '卸载方式'=76; 'GUID'=153 }
+    foreach ($name in $weights.Keys) { $dgv.Columns[$name].FillWeight = $weights[$name] }
+    foreach ($name in @('PackedGUID','UserPath','UninstallKey','UninstallString','HasMsi','HasAppwiz','IsWindowsInstaller')) {
+        $dgv.Columns[$name].Visible = $false
     }
     Set-Filter
     $txt.Focus()
 })
-# 底部按钮由 pBot.Resize 对齐，不再相对窗体宽度定位。
-# 不设置 AcceptButton：在搜索框按 Enter 绝不触发卸载
+# 不设置 Form.AcceptButton；在实时搜索框按回车不会触发任何卸载动作。
 
-$script:confirmedMode = $null
+function Confirm-SelectedRows {
+    param([System.Data.DataRow[]]$Rows)
+    $confirm = New-Object System.Windows.Forms.Form -Property @{
+        Text='请确认全部选中的卸载项目';Width=930;Height=560;StartPosition='CenterParent'
+        Font=(New-Object System.Drawing.Font -ArgumentList @('Microsoft YaHei UI',9))
+        MinimumSize=(New-Object System.Drawing.Size -ArgumentList @(760,420))
+    }
+    $header = New-Object System.Windows.Forms.Label -Property @{
+        Dock='Top';Height=66;Padding=(New-Object System.Windows.Forms.Padding -ArgumentList @(12,10,12,5))
+        Text=("本次准备处理 $($Rows.Count) 项。MSI 项目失败后可强制清理安装登记；控制面板独有项目只执行正常卸载。`r`n已选项目包含其他筛选范围中的勾选，请逐项核对：")
+    }
+    $view = New-Object System.Windows.Forms.DataGridView -Property @{
+        Dock='Fill';ReadOnly=$true;AllowUserToAddRows=$false;AllowUserToDeleteRows=$false
+        RowHeadersVisible=$false;SelectionMode='FullRowSelect';AutoSizeColumnsMode='Fill'
+    }
+    $confirmTable = New-Object System.Data.DataTable
+    foreach ($name in @('软件名称','版本','来源','卸载方式')) { [void]$confirmTable.Columns.Add($name,[string]) }
+    foreach ($r in $Rows) {
+        [void]$confirmTable.Rows.Add([string]$r['软件名称'],[string]$r['版本'],[string]$r['来源'],[string]$r['卸载方式'])
+    }
+    $view.DataSource = $confirmTable.DefaultView
+    $buttons = New-Object System.Windows.Forms.Panel -Property @{Dock='Bottom';Height=55}
+    $yes = New-Object System.Windows.Forms.Button -Property @{Text='确认开始卸载';Width=145;Height=33;DialogResult='Yes';Top=10;Left=610;Anchor='Top,Right'}
+    $no = New-Object System.Windows.Forms.Button -Property @{Text='取消';Width=105;Height=33;DialogResult='No';Top=10;Left=765;Anchor='Top,Right'}
+    $buttons.Controls.AddRange(@($yes,$no))
+    $buttons.Add_Resize({
+        $no.Left = $buttons.ClientSize.Width - $no.Width - 14
+        $yes.Left = $no.Left - $yes.Width - 10
+    })
+    $confirm.Controls.Add($view)
+    $confirm.Controls.Add($header)
+    $confirm.Controls.Add($buttons)
+    $confirm.CancelButton = $no
+    try { return ($confirm.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::Yes) }
+    finally { $confirm.Dispose() }
+}
+
 $script:selection = @()
 $btnOk.Add_Click({
-    $rows = @($script:dt.Select("全选 = true AND 模式 = '$script:mode'"))
-    if ($rows.Count -eq 0) { [void](Show-Dialog '请先勾选要卸载的软件。' '未选择软件' 'OK' 'Information'); return }
-    $preview = @($rows | Select-Object -First 18 | ForEach-Object { '• ' + $_['软件名称'] }) -join "`r`n"
-    if ($rows.Count -gt 18) { $preview += "`r`n……还有 $($rows.Count-18) 项" }
-    $caption = if ($script:mode -eq 'MSI') {
-        'MSI 模式：先正常卸载；失败后逐项询问是否备份并强制清理安装记录。'
-    } else { 'appwiz.cpl 模式：只调用原生卸载程序，不执行任何注册表强制清理。' }
-    $answer = Show-Dialog ("确认卸载以下 $($rows.Count) 项？`r`n`r`n$caption`r`n`r`n$preview") '请确认全部卸载项目' 'YesNo' 'Warning'
-    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $rows = @($script:dt.Select('全选 = true'))
+    if ($rows.Count -eq 0) { [void](Show-Dialog '请先勾选要卸载的软件。' '尚未选择' 'OK' 'Information'); return }
+    if (-not (Confirm-SelectedRows $rows)) { return }
     $script:selection = $rows
-    $script:confirmedMode = $script:mode
     $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $form.Close()
 })
 
-# ============================== 卸载与备份 ==============================
+# ============================== 卸载核心 ==============================
 function Invoke-Process {
-    param([string]$FileName,[string]$Arguments)
+    param([string]$FileName,[string]$Arguments,[bool]$Hidden = $false)
     try {
-        if ([string]::IsNullOrWhiteSpace($Arguments)) {
-            $p = Start-Process -FilePath $FileName -Wait -PassThru -ErrorAction Stop
-        }
-        else {
-            $p = Start-Process -FilePath $FileName -ArgumentList $Arguments -Wait -PassThru -ErrorAction Stop
-        }
+        $opt = @{ FilePath=$FileName; Wait=$true; PassThru=$true; ErrorAction='Stop' }
+        if (-not [string]::IsNullOrWhiteSpace($Arguments)) { $opt['ArgumentList'] = $Arguments }
+        if ($Hidden) { $opt['WindowStyle'] = 'Hidden' }
+        $p = Start-Process @opt
         return [pscustomobject]@{ Ok=$true; Code=[int]$p.ExitCode; Error='' }
     }
     catch { return [pscustomobject]@{ Ok=$false; Code=-1; Error=$_.Exception.Message } }
@@ -357,89 +414,100 @@ function Invoke-Process {
 
 function Get-CleanTargets {
     param([System.Data.DataRow]$Row)
-    $pk = [string]$Row['PackedGUID']
+    if ([string]$Row['HasMsi'] -ne 'True') { throw '此项目没有 MSI UserData 记录，不允许强制清理。' }
+    $packed = [string]$Row['PackedGUID']
     $guid = [string]$Row['GUID']
-    if ($pk -notmatch '^[0-9A-Fa-f]{32}$' -or $guid -notmatch '^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
-        throw '产品 GUID 或 PackedGUID 无效；拒绝清理。'
+    if ($packed -notmatch '^[0-9A-Fa-f]{32}$' -or -not (Test-ProductGuid $guid)) {
+        throw '无效的产品 GUID 或 PackedGUID，拒绝清理。'
     }
-    if ($guid -ine (Convert-PackedGuid $pk)) { throw 'GUID 与 PackedGUID 不一致；拒绝清理。' }
+    if ($guid -ine (Convert-PackedGuid $packed)) { throw 'GUID 与 PackedGUID 不一致，拒绝清理。' }
     $origin = Get-NativeRegistryPath ([string]$Row['UserPath'])
     if ($origin -notmatch '^HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\[^\\]+\\Products\\[0-9A-Fa-f]{32}$' -or
-        -not $origin.EndsWith('\' + $pk,[StringComparison]::OrdinalIgnoreCase)) {
-        throw '产品 UserData 路径不符合预期；拒绝清理。'
+        -not $origin.EndsWith(('\' + $packed),[StringComparison]::OrdinalIgnoreCase)) {
+        throw 'UserData 源路径不符合预期，拒绝清理。'
     }
-    $paths = @(
+    $candidate = @(
         "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$guid"
         "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$guid"
-        "HKLM\SOFTWARE\Classes\Installer\Products\$pk"
-        "HKLM\SOFTWARE\Classes\Installer\Features\$pk"
+        "HKLM\SOFTWARE\Classes\Installer\Products\$packed"
+        "HKLM\SOFTWARE\Classes\Installer\Features\$packed"
         $origin
     )
-    # UpgradeCodes 中仅删除名称为本产品 PackedGUID 的特定值，绝不删除整个 UpgradeCodes 键。
-    $upgrade = 'HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes'
-    if (Test-Path -LiteralPath $upgrade) {
-        foreach ($item in @(Get-ChildItem -LiteralPath $upgrade -ErrorAction Stop)) {
-            if (@($item.GetValueNames()) -contains $pk) { $paths += (Get-NativeRegistryPath $item.PSPath) }
+    # 仅在当前用户的控制面板卸载记录确属 MSI 产品时才加入该键。
+    $appKey = [string]$Row['UninstallKey']
+    if ($appKey -match '^HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\{[0-9A-Fa-f-]{36}\}$' -and
+        $appKey.EndsWith(('\' + $guid),[StringComparison]::OrdinalIgnoreCase)) { $candidate += $appKey }
+    $upgradeRoot = 'HKLM:\SOFTWARE\Classes\Installer\UpgradeCodes'
+    $upgradePaths = @()
+    if (Test-Path -LiteralPath $upgradeRoot) {
+        foreach ($key in @(Get-ChildItem -LiteralPath $upgradeRoot -ErrorAction Stop)) {
+            if (@($key.GetValueNames()) -contains $packed) { $upgradePaths += (Get-NativeRegistryPath $key.PSPath) }
         }
     }
-    $existing = @()
-    foreach ($native in ($paths | Select-Object -Unique)) {
+    $existingKeys = @()
+    foreach ($native in ($candidate | Select-Object -Unique)) {
         $provider = Get-ProviderRegistryPath $native
-        if ($provider -and (Test-Path -LiteralPath $provider)) { $existing += $native }
+        if ($provider -and (Test-Path -LiteralPath $provider)) { $existingKeys += $native }
     }
-    return [pscustomobject]@{ KeyPaths=$existing; Packed=$pk; Origin=$origin }
+    # 键备份必须覆盖 UpgradeCodes 中将会删除值的父键；删除时只删匹配 packed 的值。
+    foreach ($native in $upgradePaths) {
+        $provider = Get-ProviderRegistryPath $native
+        if ($provider -and (Test-Path -LiteralPath $provider)) { $existingKeys += $native }
+    }
+    return [pscustomobject]@{ KeyPaths=@($existingKeys | Select-Object -Unique); Packed=$packed; Origin=$origin }
 }
 
 function Backup-RegistryKeys {
     param([string[]]$NativePaths,[string]$ProductName)
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
-    $safeName = [regex]::Replace($ProductName,'[^\p{L}\p{N} _.-]','_')
-    if ($safeName.Length -gt 45) { $safeName = $safeName.Substring(0,45) }
-    $folder = Join-Path (Join-Path $script:baseDir 'Backups') ('{0}_{1}' -f $stamp,$safeName)
+    $safe = [regex]::Replace($ProductName,'[^\p{L}\p{N} _.-]','_')
+    if ($safe.Length -gt 42) { $safe = $safe.Substring(0,42) }
+    $folder = Join-Path (Join-Path $script:baseDir 'Backups') ('{0}_{1}_{2}' -f $stamp,$safe,([Guid]::NewGuid().ToString('N').Substring(0,6)))
     [void][IO.Directory]::CreateDirectory($folder)
-    for ($i=0; $i -lt $NativePaths.Count; $i++) {
-        $target = $NativePaths[$i]
-        $fileName = Join-Path $folder ('Key_{0:D2}.reg' -f ($i + 1))
-        & reg.exe export $target $fileName /y 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $fileName)) {
-            throw "注册表备份失败：$target。未执行删除。备份目录：$folder"
+    for ($j=0; $j -lt $NativePaths.Count; $j++) {
+        $native = $NativePaths[$j]
+        $regFile = Join-Path $folder ('Key_{0:D2}.reg' -f ($j + 1))
+        & reg.exe export $native $regFile /y 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $regFile) -or ((Get-Item -LiteralPath $regFile).Length -eq 0)) {
+            throw "注册表备份失败：$native。未执行强制删除。备份目录：$folder"
         }
     }
-    Write-Log ("注册表备份完成：$folder，$($NativePaths.Count) 个键。")
+    Write-Log ("备份完成：$folder；键数=$($NativePaths.Count)")
     return $folder
 }
 
 function Invoke-ForceRegistryCleanup {
     param([System.Data.DataRow]$Row)
+    $name = [string]$Row['软件名称']
     try {
         $targets = Get-CleanTargets $Row
-        if ($targets.KeyPaths.Count -eq 0) { throw '未找到对应的 MSI 安装登记键，未执行清理。' }
-        $backupDir = Backup-RegistryKeys $targets.KeyPaths ([string]$Row['软件名称'])
-        # 仅备份完毕后才开始执行删除
+        if ($targets.KeyPaths.Count -eq 0) { throw '找不到与该 MSI 对应的安装登记项，未删除。' }
+        $backupDir = Backup-RegistryKeys $targets.KeyPaths $name
         $errors = @()
         foreach ($native in $targets.KeyPaths) {
             $provider = Get-ProviderRegistryPath $native
             if ($native -match '^HKLM\\SOFTWARE\\Classes\\Installer\\UpgradeCodes\\') {
                 try {
                     Remove-ItemProperty -LiteralPath $provider -Name $targets.Packed -Force -ErrorAction Stop
-                    Write-Log ("已移除 UpgradeCodes 的产品值：$native -> $($targets.Packed)")
+                    Write-Log ("清理 UpgradeCodes 中产品值：$native / $($targets.Packed)")
                 }
-                catch { $errors += "$native : $($_.Exception.Message)" }
+                catch { $errors += "$native：$($_.Exception.Message)" }
             }
             else {
                 try {
                     Remove-Item -LiteralPath $provider -Recurse -Force -ErrorAction Stop
-                    Write-Log ("已清理注册表键：$native")
+                    Write-Log ("清理安装记录键：$native")
                 }
-                catch { $errors += "$native : $($_.Exception.Message)" }
+                catch { $errors += "$native：$($_.Exception.Message)" }
             }
         }
-        if ($errors.Count -gt 0) { throw ('部分项目清理失败：' + ($errors -join ' | ') + '；备份目录：' + $backupDir) }
-        return [pscustomobject]@{ Success=$true; Message=('已清理登记项；备份：' + $backupDir) }
+        if ($errors.Count -gt 0) { throw ("部分清理失败：" + ($errors -join ' | ') + "；备份：$backupDir") }
+        Write-Log ("MSI 登记清理完成：$name；备份：$backupDir")
+        return '仅 MSI 安装登记已清理'
     }
     catch {
-        Write-Log ('强制清理中止或失败：' + $_.Exception.Message)
-        return [pscustomobject]@{Success=$false; Message=$_.Exception.Message}
+        Write-Log ("强制清理失败：$name；$($_.Exception.Message)")
+        return ('强制清理失败：' + $_.Exception.Message)
     }
 }
 
@@ -447,95 +515,87 @@ function Invoke-MsiUninstall {
     param([System.Data.DataRow]$Row)
     $name = [string]$Row['软件名称']
     $guid = [string]$Row['GUID']
-    Write-Log ('MSI 卸载开始：' + $name + ' ' + $guid)
-    $code = -1
-    $reason = ''
-    if ($guid -match '^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
-        # 不再给非 Autodesk 软件注入 ADSK_SETUP_EXE=1；使用 /qn 不弹 MSI 卸载界面
-        $result = Invoke-Process 'msiexec.exe' ("/x $guid REBOOT=ReallySuppress /qn")
-        $code = $result.Code
-        if (-not $result.Ok) { $reason = $result.Error }
+    if (-not (Test-ProductGuid $guid)) { Write-Log ("MSI GUID 不合法：$name"); return '失败（无效 GUID）' }
+    Write-Log ("MSI 卸载开始：$name；ProductCode=$guid")
+    $result = Invoke-Process 'msiexec.exe' ("/x $guid REBOOT=ReallySuppress /qn") $true
+    $code = [int]$result.Code
+    if ($result.Ok -and $code -in @(0,3010,1641)) {
+        Write-Log ("MSI 正常卸载成功：$name；退出码=$code")
+        return '正常 MSI 卸载成功'
     }
-    else { $reason = '无法识别有效的 MSI 产品 GUID。' }
-    if ($code -in @(0,3010,1641)) {
-        Write-Log ("MSI 正常卸载成功：$name；退出码：$code")
-        return '成功'
+    Write-Log ("MSI 卸载失败：$name；退出码=$code；$($result.Error)")
+    if (-not $result.Ok) { return ('未能启动 msiexec：' + $result.Error) }
+    if ($code -eq 1602) { return '已取消（1602，不强制清理）' }
+    if ($code -eq 1618) { return '安装冲突（1618，稍后重试）' }
+
+    if ($script:autoForceOnFailure) {
+        Write-Log ("根据 INI 自动备份并强制清理：$name，退出码=$code")
+        return (Invoke-ForceRegistryCleanup $Row)
     }
-    Write-Log ("MSI 卸载失败：$name；退出码：$code；$reason")
-    # 在卸载失败后才允许用户明确选择是否强制清理，且按软件逐项确认。
-    $msg = "MSI 卸载失败：$name`r`n产品 GUID：$guid`r`n退出码：$code`r`n$reason`r`n`r`n是否备份后【仅强制删除该产品的 MSI 安装登记项】？`r`n`r`n注意：这不会删除软件文件，也不保证重装问题得到解决。`r`n请不要对可能正在安装、修复或升级的产品执行此操作。"
-    $answer = Show-Dialog $msg 'MSI 卸载失败 - 可选强制清理' 'YesNo' 'Warning'
+    $text = "MSI 正常卸载失败：$name`r`n产品 GUID：$guid`r`n错误码：$code`r`n`r`n是否先备份注册表，然后强制清理这个产品的 MSI 安装登记？`r`n`r`n注意：不会自动删除程序文件、服务或驱动，也不保证修复重新安装问题。"
+    $answer = Show-Dialog $text 'MSI 卸载失败 - 是否强制清理' 'YesNo' 'Warning'
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-        Write-Log ("用户跳过 MSI 强制清理：$name")
-        return '失败（已跳过清理）'
+        Write-Log ("用户取消强制清理：$name")
+        return ("MSI 卸载失败（$code），未清理")
     }
-    $clean = Invoke-ForceRegistryCleanup $Row
-    if ($clean.Success) {
-        Write-Log ("MSI 强制清理完成：$name；$($clean.Message)")
-        return '仅安装登记已清理'
-    }
-    return '强制清理失败'
+    return (Invoke-ForceRegistryCleanup $Row)
 }
 
 function Split-UninstallCommand {
     param([string]$RawCommand)
-    $cmd = [Environment]::ExpandEnvironmentVariables($RawCommand.Trim())
-    if ($cmd -match '^"([^"]+)"\s*(.*)$') { return @($matches[1],$matches[2]) }
-    if ($cmd -match '^(.+?\.(?:exe|com))(?:\s+(.*))?$') { return @($matches[1],$matches[2]) }
-    # 普通的可执行文件名（例如 rundll32.exe）也符合上一项
+    $command = [Environment]::ExpandEnvironmentVariables($RawCommand.Trim())
+    if ($command -match '^"([^"\r\n]+)"\s*(.*)$') { return @($matches[1],$matches[2]) }
+    if ($command -match '^(.+?\.(?:exe|com))(?:\s+(.*))?$') { return @($matches[1],$matches[2]) }
     return @('','')
 }
-
 function Invoke-AppwizUninstall {
     param([System.Data.DataRow]$Row)
     $name = [string]$Row['软件名称']
     $cmd = [string]$Row['UninstallString']
     $isMsi = ([string]$Row['IsWindowsInstaller'] -eq 'True')
     $guid = [string]$Row['GUID']
-    Write-Log ('appwiz.cpl 正常卸载开始：' + $name + '；注册表路径：' + $Row['UninstallKey'])
-    if ($isMsi -or $cmd -match '(?i)\bmsiexec(?:\.exe)?\b') {
-        if (-not $guid) { $guid = [regex]::Match($cmd,'\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}').Value }
-        if ($guid -notmatch '^\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
-            Write-Log ('appwiz.cpl 项目缺少有效 GUID：' + $name)
-            return '失败（无有效 MSI GUID）'
+    Write-Log ("控制面板卸载开始：$name；登记键=$($Row['UninstallKey'])")
+    if ($isMsi -or ($cmd -match '(?i)^\s*"?[^"\r\n]*?\bmsiexec(?:\.exe)?"?(?:\s|$)')) {
+        if (-not (Test-ProductGuid $guid)) { $guid = [regex]::Match($cmd,'\{[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}').Value }
+        if (-not (Test-ProductGuid $guid)) {
+            Write-Log ("控制面板 MSI 项目无法得到 ProductCode：$name")
+            return '失败（没有有效 MSI ProductCode）'
         }
-        # 控制面板中的 MSI 项目：以交互式 /x 调用，绝不进入 MSI 强制清理通道
+        # 控制面板独有 MSI 安装项只进行正常交互式卸载，不调用强制清理。
         $result = Invoke-Process 'msiexec.exe' ("/x $guid")
     }
     else {
-        if ([string]::IsNullOrWhiteSpace($cmd)) { Write-Log ('无卸载命令：' + $name); return '跳过（无卸载命令）' }
+        if ([string]::IsNullOrWhiteSpace($cmd)) { Write-Log ("没有正常卸载命令：$name"); return '跳过（无卸载命令）' }
         $parts = Split-UninstallCommand $cmd
-        if (-not $parts[0]) {
-            Write-Log ('无法安全解析卸载命令：' + $cmd)
-            return '跳过（卸载命令格式不支持）'
-        }
-        # 直接调用注册的可执行文件及参数，不通过 cmd.exe /c，避免对字符串二次解释
+        if (-not $parts[0]) { Write-Log ("命令无法解析：$cmd"); return '跳过（卸载命令不支持）' }
         $result = Invoke-Process ([string]$parts[0]) ([string]$parts[1])
     }
-    if (-not $result.Ok) {
-        Write-Log ("appwiz.cpl 卸载无法启动：$name；$($result.Error)")
-        return '失败（无法启动卸载程序）'
-    }
-    Write-Log ("appwiz.cpl 卸载器已退出：$name；退出码 $($result.Code)（非 MSI 卸载器的退出码不一定代表卸载成功）")
-    if ($result.Code -in @(0,3010,1641)) { return '卸载器已正常退出（需确认是否卸载完成）' }
-    return ('卸载器返回非成功码：' + $result.Code)
+    if (-not $result.Ok) { Write-Log ("卸载器无法启动：$name；$($result.Error)"); return ('卸载器启动失败：' + $result.Error) }
+    Write-Log ("控制面板卸载器已退出：$name；退出码=$($result.Code)")
+    if ($result.Code -in @(0,3010,1641)) { return '正常卸载程序已退出（请确认结果）' }
+    return ("卸载程序返回：$($result.Code)")
 }
 
+# 先关闭唯一窗体；之后逐条执行智能卸载。不是两个连续的 GUI 脚本。
 if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $script:selection.Count -gt 0) {
-    Write-Log ("批量任务开始：模式=$script:confirmedMode；数量=$($script:selection.Count)")
+    $msiSelected = @($script:selection | Where-Object { $_['HasMsi'] -eq 'True' }).Count
+    Write-Log ("批量卸载开始：总数=$($script:selection.Count)；MSI=$msiSelected；控制面板独有=$($script:selection.Count-$msiSelected)")
     $outcomes = @()
     foreach ($item in $script:selection) {
         $name = [string]$item['软件名称']
+        $method = if ([string]$item['HasMsi'] -eq 'True') { 'MSI' } else { '控制面板' }
         try {
-            $status = if ($script:confirmedMode -eq 'MSI') { Invoke-MsiUninstall $item } else { Invoke-AppwizUninstall $item }
+            if ($method -eq 'MSI') { $status = Invoke-MsiUninstall $item }
+            else { $status = Invoke-AppwizUninstall $item }
         }
-        catch { $status = '处理异常'; Write-Log ("异常：$name；$($_.Exception.Message)") }
-        $outcomes += [pscustomobject]@{ Name=$name; Status=[string]$status }
+        catch { $status = '处理异常'; Write-Log ("处理异常：$name；$($_.Exception.Message)") }
+        $outcomes += [pscustomobject]@{ Name=$name; Method=$method; Status=[string]$status }
+        Write-Log ("卸载任务结果：$name / $method / $status")
     }
-    $summary = @($outcomes | Select-Object -First 18 | ForEach-Object { "$($_.Name)：$($_.Status)" }) -join "`r`n"
-    if ($outcomes.Count -gt 18) { $summary += "`r`n……其余结果请查看日志" }
-    Write-Log ('任务结束。日志：' + $script:logPath)
-    [void](Show-Dialog ("处理完成，共 $($outcomes.Count) 项。`r`n`r`n$summary`r`n`r`n日志：$script:logPath") '任务处理结果' 'OK' 'Information')
+    $resultText = @($outcomes | Select-Object -First 20 | ForEach-Object { "$($_.Name) [$($_.Method)]：$($_.Status)" }) -join "`r`n"
+    if ($outcomes.Count -gt 20) { $resultText += "`r`n……更多详情请查看本地日志" }
+    Write-Log ('批量任务结束；日志：' + $script:logPath)
+    [void](Show-Dialog ("处理完毕，共 $($outcomes.Count) 项。`r`n`r`n$resultText`r`n`r`n日志：$script:logPath") '卸载结果' 'OK' 'Information')
 }
-else { Write-Log '用户关闭窗口；未执行卸载。' }
+else { Write-Log '用户关闭窗口，未执行卸载。' }
 $form.Dispose()
